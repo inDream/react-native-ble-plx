@@ -1,11 +1,16 @@
 package com.polidea.reactnativeble;
 
 import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothGattCharacteristic;
 import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothManager;
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.location.LocationManager;
 import android.os.Build;
 import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
@@ -63,6 +68,9 @@ public class BleModule extends ReactContextBaseJavaModule {
 
     // Name of module
     private static final String NAME = "BleClientManager";
+    private ReactApplicationContext mContext;
+    private BluetoothAdapter mBluetoothAdapter;
+    private Boolean scanning = false;
 
     // Value converters
     private final ErrorConverter errorConverter = new ErrorConverter();
@@ -98,8 +106,33 @@ public class BleModule extends ReactContextBaseJavaModule {
     // Current native library log level.
     private int currentLogLevel = RxBleLog.NONE;
 
+    private BroadcastReceiver mReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+
+            if (BluetoothDevice.ACTION_FOUND.equals(action)) {
+                BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                if (device != null) {
+                    final RxBleDevice bleDevice = rxBleClient.getBleDevice(device.getAddress());
+                    RxBleScanResult rxBleScanResult = new RxBleScanResult(bleDevice, 0, new byte[0]);
+                    sendEvent(Event.ScanEvent, scanConverter.toJSCallback(rxBleScanResult));
+                }
+            } else if (BluetoothAdapter.ACTION_DISCOVERY_FINISHED.equals(action)) {
+                scanning = false;
+                mContext.unregisterReceiver(mReceiver);
+            }
+        }
+    };
+
     public BleModule(ReactApplicationContext reactContext) {
         super(reactContext);
+        mContext = reactContext;
+
+        final BluetoothManager bluetoothManager = (BluetoothManager) mContext.getSystemService(Context.BLUETOOTH_SERVICE);
+        if (bluetoothManager != null) {
+            mBluetoothAdapter = bluetoothManager.getAdapter();
+        }
     }
 
     @Override
@@ -120,9 +153,8 @@ public class BleModule extends ReactContextBaseJavaModule {
 
     @ReactMethod
     public void createClient(String restoreStateIdentifier) {
-        final ReactApplicationContext context = getReactApplicationContext();
-        rxBleClient = RxBleClient.create(context);
-        adapterStateChangesSubscription = monitorAdapterStateChanges(context);
+        rxBleClient = RxBleClient.create(mContext);
+        adapterStateChangesSubscription = monitorAdapterStateChanges(mContext);
 
         // We need to send signal that BLE Module starts without restored state
         if (restoreStateIdentifier != null) {
@@ -207,13 +239,11 @@ public class BleModule extends ReactContextBaseJavaModule {
             return BluetoothState.UNSUPPORTED;
         }
 
-        final ReactApplicationContext context = getReactApplicationContext();
-        final BluetoothManager bluetoothManager = (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
+        final BluetoothManager bluetoothManager = (BluetoothManager) mContext.getSystemService(Context.BLUETOOTH_SERVICE);
         if (bluetoothManager == null) {
             return BluetoothState.POWERED_OFF;
         }
-        final BluetoothAdapter bluetoothAdapter = bluetoothManager.getAdapter();
-        return nativeAdapterStateToReactNativeBluetoothState(bluetoothAdapter.getState());
+        return nativeAdapterStateToReactNativeBluetoothState(mBluetoothAdapter.getState());
     }
 
     private boolean supportsBluetoothLowEnergy() {
@@ -270,23 +300,42 @@ public class BleModule extends ReactContextBaseJavaModule {
         if (rxBleClient == null) {
             throw new IllegalStateException("BleManager not created when tried to start device scan");
         }
-        scanSubscription = rxBleClient
-                .scanBleDevices(uuids)
-                .subscribe(new Action1<RxBleScanResult>() {
-                    @Override
-                    public void call(RxBleScanResult rxBleScanResult) {
-                        sendEvent(Event.ScanEvent, scanConverter.toJSCallback(rxBleScanResult));
-                    }
-                }, new Action1<Throwable>() {
-                    @Override
-                    public void call(Throwable throwable) {
-                        sendEvent(Event.ScanEvent, errorConverter.toError(throwable).toJSCallback());
-                    }
-                });
+        LocationManager lm = (LocationManager)mContext.getSystemService(Context.LOCATION_SERVICE);
+        boolean gps_enabled = false;
+
+        try {
+            gps_enabled = lm.isProviderEnabled(LocationManager.GPS_PROVIDER);
+        } catch (Exception e) {}
+
+        if (!gps_enabled && !scanning) {
+            scanning = true;
+            mBluetoothAdapter.startDiscovery();
+
+            mContext.registerReceiver(mReceiver, new IntentFilter(BluetoothDevice.ACTION_FOUND));
+            mContext.registerReceiver(mReceiver, new IntentFilter(BluetoothAdapter.ACTION_DISCOVERY_FINISHED));
+        } else if (gps_enabled) {
+            scanSubscription = rxBleClient
+                    .scanBleDevices(uuids)
+                    .subscribe(new Action1<RxBleScanResult>() {
+                        @Override
+                        public void call(RxBleScanResult rxBleScanResult) {
+                            sendEvent(Event.ScanEvent, scanConverter.toJSCallback(rxBleScanResult));
+                        }
+                    }, new Action1<Throwable>() {
+                        @Override
+                        public void call(Throwable throwable) {
+                            sendEvent(Event.ScanEvent, errorConverter.toError(throwable).toJSCallback());
+                        }
+                    });
+        }
     }
 
     @ReactMethod
     public void stopDeviceScan() {
+        if (mBluetoothAdapter != null && scanning) {
+            scanning = false;
+            mBluetoothAdapter.cancelDiscovery();
+        }
         if (scanSubscription != null) {
             if (!scanSubscription.isUnsubscribed()) {
                 scanSubscription.unsubscribe();
